@@ -1,82 +1,126 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-STFT / ISTFT  —  ONNX-exportable Short-Time Fourier Transform.
+STFT / ISTFT - ONNX-exportable Short-Time Fourier Transform.
 
-This script:
-  1. Builds a PyTorch model that performs STFT or ISTFT using Conv1d /
-     ConvTranspose1d (no torch.stft / torch.istft at runtime).
-  2. Exports the model to ONNX with optional dynamic axes.
-  3. Validates the ONNX graph against torch.stft / torch.istft.
-  4. Runs a round-trip (STFT → ISTFT) reconstruction test.
+This module provides PyTorch-based STFT and ISTFT implementations using Conv1d
+and ConvTranspose1d operations, making them exportable to ONNX format without
+relying on torch.stft/torch.istft at runtime.
+
+Features:
+    - Configurable FFT parameters (n_fft, win_length, hop_length)
+    - Multiple window functions (hann, hamming, blackman, bartlett, kaiser)
+    - Center padding support for frame alignment
+    - Two STFT variants: real-only (A) and real+imag (B)
+    - Two ISTFT variants: magnitude+phase (A) and real+imag (B)
+    - ONNX export with dynamic axes support
+    - Validation against torch.stft/torch.istft references
+    - Round-trip reconstruction testing
+
+Example:
+    >>> from STFT_Process import STFT_Process, main
+    >>> # Export STFT/ISTFT models to ONNX
+    >>> main()
+    >>> # Use exported models
+    >>> import onnxruntime as ort
+    >>> session = ort.InferenceSession("stft_B.onnx")
 """
 
 import torch
 import numpy as np
 import onnxruntime as ort
 from onnxslim import slim
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 1.  Configuration
-# ═════════════════════════════════════════════════════════════════════════════
-
-# -- Export settings --------------------------------------------------------
-DYNAMIC_AXES = True          # True  → ONNX graph accepts variable-length audio
-                             # False → fixed to INPUT_AUDIO_LENGTH
-OPSET = 17                   # ONNX Runtime export setting
-
-# -- FFT / framing parameters ----------------------------------------------
-NFFT         = 400           # FFT size (number of frequency bins before folding)
-WIN_LENGTH   = 400           # Analysis window length in samples (≤ NFFT)
-HOP_LENGTH   = 160           # Hop (stride) between successive frames
-WINDOW_TYPE  = 'hann'        # Window function: bartlett | blackman | hamming | hann | kaiser
-
-# -- Padding ---------------------------------------------------------------
-CENTER_PAD   = True          # True  → pad signal so frame centres align with sample indices
-                             # False → no padding, first frame starts at sample 0
-PAD_MODE     = 'constant'    # Padding style when CENTER_PAD is True: 'reflect' | 'constant'
-
-# -- Audio dimensions (used for dummy tensors during export) ----------------
-INPUT_AUDIO_LENGTH = 16000   # Length of the test / dummy waveform (samples)
-MAX_SIGNAL_LENGTH  = 2048    # Upper-bound hint for frame-axis dim
-
-# -- Model variants to export ----------------------------------------------
-#    stft_A  / istft_A  →  real-only STFT  /  magnitude+phase ISTFT
-#    stft_B  / istft_B  →  real+imag STFT  /  real+imag       ISTFT
-STFT_TYPE  = "stft_B"
-ISTFT_TYPE = "istft_B"
-
-# -- Derived export paths ---------------------------------------------------
-export_path_stft  = f"{STFT_TYPE}.onnx"
-export_path_istft = f"{ISTFT_TYPE}.onnx"
+from typing import Tuple, Optional, Dict, Any, List
+from dataclasses import dataclass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2.  Derived constants & helpers
+# CONFIGURATION
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Clamp parameters so they never exceed input length or each other.
-NFFT       = min(NFFT, INPUT_AUDIO_LENGTH)
-WIN_LENGTH = min(WIN_LENGTH, NFFT)
-HOP_LENGTH = min(HOP_LENGTH, INPUT_AUDIO_LENGTH)
-HALF_NFFT  = NFFT // 2       # Number of positive-frequency bins (excluding DC & Nyquist)
+@dataclass
+class STFTConfig:
+    """Configuration dataclass for STFT/ISTFT parameters."""
+    
+    # Export settings
+    dynamic_axes: bool = True
+    opset: int = 17
+    
+    # FFT/framing parameters
+    n_fft: int = 400
+    win_length: int = 400
+    hop_length: int = 160
+    window_type: str = 'hann'
+    
+    # Padding settings
+    center_pad: bool = True
+    pad_mode: str = 'constant'
+    
+    # Audio dimensions
+    input_audio_length: int = 16000
+    max_signal_length: int = 2048
+    
+    # Model variants
+    stft_type: str = "stft_B"
+    istft_type: str = "istft_B"
+    
+    def __post_init__(self):
+        """Validate and adjust configuration parameters."""
+        # Clamp parameters
+        self.n_fft = min(self.n_fft, self.input_audio_length)
+        self.win_length = min(self.win_length, self.n_fft)
+        self.hop_length = min(self.hop_length, self.input_audio_length)
+        
+        # Validate window type
+        valid_windows = {'bartlett', 'blackman', 'hamming', 'hann', 'kaiser'}
+        if self.window_type not in valid_windows:
+            raise ValueError(f"Invalid window_type: {self.window_type}. Must be one of {valid_windows}")
+        
+        # Validate model types
+        if self.stft_type not in ('stft_A', 'stft_B'):
+            raise ValueError(f"Invalid stft_type: {self.stft_type}")
+        if self.istft_type not in ('istft_A', 'istft_B'):
+            raise ValueError(f"Invalid istft_type: {self.istft_type}")
+    
+    @property
+    def half_n_fft(self) -> int:
+        """Return half of n_fft."""
+        return self.n_fft // 2
+    
+    @property
+    def stft_signal_length(self) -> int:
+        """Calculate number of STFT frames."""
+        if self.center_pad:
+            return self.input_audio_length // self.hop_length + 1
+        else:
+            return (self.input_audio_length - self.n_fft) // self.hop_length + 1
+    
+    @property
+    def export_paths(self) -> Dict[str, str]:
+        """Return export paths for STFT and ISTFT models."""
+        return {
+            'stft': f"{self.stft_type}.onnx",
+            'istft': f"{self.istft_type}.onnx"
+        }
 
-# Number of STFT frames produced for INPUT_AUDIO_LENGTH samples.
-if CENTER_PAD:
-    # Center padding adds HALF_NFFT zeros on each side → one extra frame.
-    STFT_SIGNAL_LENGTH = INPUT_AUDIO_LENGTH // HOP_LENGTH + 1
-else:
-    STFT_SIGNAL_LENGTH = (INPUT_AUDIO_LENGTH - NFFT) // HOP_LENGTH + 1
 
-# -- Window function registry ----------------------------------------------
-WINDOW_FUNCTIONS = {
+# Default configuration instance
+DEFAULT_CONFIG = STFTConfig()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WINDOW FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+WINDOW_FUNCTIONS: Dict[str, callable] = {
     'bartlett': lambda L: torch.bartlett_window(L, periodic=True),
     'blackman': lambda L: torch.blackman_window(L, periodic=True),
     'hamming':  lambda L: torch.hamming_window(L,  periodic=True),
     'hann':     lambda L: torch.hann_window(L,     periodic=True),
     'kaiser':   lambda L: torch.kaiser_window(L,   periodic=True, beta=12.0)
 }
-DEFAULT_WINDOW_FN = lambda L: torch.hann_window(L, periodic=True)
+
+DEFAULT_WINDOW_FN: callable = lambda L: torch.hann_window(L, periodic=True)
 
 
 def create_padded_window(win_length: int, n_fft: int, window_type: str) -> torch.Tensor:
@@ -84,6 +128,14 @@ def create_padded_window(win_length: int, n_fft: int, window_type: str) -> torch
     Create a window of length *n_fft*, center-padding or cropping as needed
     so it matches the behavior of ``torch.stft`` (which always zero-pads a
     shorter window to n_fft internally).
+    
+    Args:
+        win_length: Length of the window function
+        n_fft: FFT size (target length)
+        window_type: Type of window function
+        
+    Returns:
+        Zero-padded or cropped window tensor of length n_fft
     """
     win_fn = WINDOW_FUNCTIONS.get(window_type, DEFAULT_WINDOW_FN)
     win = win_fn(win_length).float()
@@ -104,13 +156,18 @@ def create_padded_window(win_length: int, n_fft: int, window_type: str) -> torch
 
 
 def get_raw_window(win_length: int, window_type: str) -> torch.Tensor:
-    """Return the raw (un-padded) window — used by ``torch.stft`` for reference tests."""
+    """
+    Return the raw (un-padded) window — used by ``torch.stft`` for reference tests.
+    
+    Args:
+        win_length: Length of the window function
+        window_type: Type of window function
+        
+    Returns:
+        Raw window tensor without padding
+    """
     win_fn = WINDOW_FUNCTIONS.get(window_type, DEFAULT_WINDOW_FN)
     return win_fn(win_length).float()
-
-
-# Pre-compute the padded window once for reuse.
-WINDOW = create_padded_window(WIN_LENGTH, NFFT, WINDOW_TYPE)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
